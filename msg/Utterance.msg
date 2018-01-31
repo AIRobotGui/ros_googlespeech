@@ -1,4 +1,3 @@
 Header        header
-string        words
-float32       confidence
-bool          is_final
+string        data
+float32       confidence # > 0.9 is confident!

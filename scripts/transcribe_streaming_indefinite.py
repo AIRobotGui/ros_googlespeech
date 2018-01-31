@@ -1,31 +1,5 @@
 #!/usr/bin/env python
 
-# Copyright 2017 Google Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Google Cloud Speech API sample application using the streaming API.
-
-NOTE: This module requires the additional dependency `pyaudio`. To install
-using pip:
-
-    pip install pyaudio
-
-Example usage:
-    python transcribe_streaming_mic.py
-"""
-
-# [START import_libraries]
 from __future__ import division
 
 import argparse
@@ -35,6 +9,7 @@ import re
 import sys
 import threading
 import time
+import signal
 
 from google.cloud import speech
 from google.cloud.speech import enums
@@ -47,13 +22,10 @@ import six
 
 import rospy
 from ros_googlespeech.msg import Utterance
-# [END import_libraries]
 
 
 def duration_to_secs(duration):
     return duration.seconds + (duration.nanos / float(1e9))
-
-
 
 class MicrophoneStream(object):
     """Opens a recording stream as a generator yielding the audio chunks."""
@@ -87,18 +59,17 @@ class MicrophoneStream(object):
         return self
 
     def __exit__(self, type, value, traceback):
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
         self.closed = True
-        # Signal the generator to terminate so that the client's
-        # streaming_recognize method will not block the process termination.
+        self._audio_stream.close()
         self._buff.put(None)
         self._audio_interface.terminate()
+
 
     def _fill_buffer(self, in_data, *args, **kwargs):
         """Continuously collect data from the audio stream, into the buffer."""
         self._buff.put(in_data)
         return None, pyaudio.paContinue
+
 
     def generator(self):
         while not self.closed:
@@ -117,7 +88,7 @@ class MicrophoneStream(object):
                     if chunk is None:
                         return
                     data.append(chunk)
-                except queue.Empty:
+                except queue.Empty, KeyboardInterrupt:
                     break
 
             yield b''.join(data)
@@ -144,6 +115,7 @@ class ResumableMicrophoneStream(MicrophoneStream):
         while self._untranscribed and end_time > self._untranscribed[0][1]:
             self._untranscribed.popleft()
 
+
     def generator(self, resume=False):
         total_bytes_sent = 0
         if resume:
@@ -160,6 +132,7 @@ class ResumableMicrophoneStream(MicrophoneStream):
             self._untranscribed.append((byte_data, chunk_end_time))
 
             yield byte_data
+
 
 def _record_keeper(responses, stream):
     """Calls the stream's on_transcribe callback for each final response.
@@ -181,6 +154,7 @@ def _record_keeper(responses, stream):
 
 
 
+
 def listen_print_loop_finite(responses):
     """Iterates through server responses and prints them.
 
@@ -193,7 +167,7 @@ def listen_print_loop_finite(responses):
 
     In this case, responses are provided for interim results as well. If the
     response is an interim one, print a line feed at the end of it, to allow
-    the next result to overwrite it, until the response is a final one. For the
+    the next result to overwrite         try:it, until the response is a final one. For the
     final one, print a newline to preserve the finalized transcription.
     """
     num_chars_printed = 0
@@ -242,66 +216,144 @@ def listen_print_loop(responses, stream):
     listen_print_loop_finite(_record_keeper(with_results, stream))
 
 
-def main(sample_rate):
-    # Initialize ROS stuff
-    rospy.init_node('gspeech_node', anonymous=True)
-    # Publishers
-    pub = rospy.Publisher('utterances', Utterance, queue_size=10)
-
-    # See http://g.co/cloud/speech/docs/languages
-    # for a list of supported languages.
-    language_code = 'en-US'  # a BCP-47 language tag
-
-    client = speech.SpeechClient()
-    config = types.RecognitionConfig(
-        encoding=enums.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=sample_rate,
-        language_code=language_code,
-        max_alternatives=1,
-        enable_word_time_offsets=True)
-    streaming_config = types.StreamingRecognitionConfig(
-        config=config,
-        interim_results=True)
 
 
-    mic_manager = ResumableMicrophoneStream(
-            sample_rate, int(sample_rate / 10))
+def listen_publish_loop_finite(responses):
+    """Iterates through server responses and prints them.
 
-    try:
-        with mic_manager as stream:
-            resume = False
-            while True:
-                audio_generator = stream.generator(resume=resume)
-                requests = (types.StreamingRecognizeRequest(audio_content=content)
-                            for content in audio_generator)
+    The responses passed is a generator that will block until a response
+    is provided by the server.
 
-                responses = client.streaming_recognize(streaming_config, requests)
+    Each response may contain multiple results, and each result may contain
+    multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
+    print only the transcription for the top alternative of the top result.
 
-                try:
-                    # Now, put the transcription responses to use.
-                    listen_print_loop(responses, stream)
-                    break
-                except grpc.RpcError, e:
-                    if e.code() not in (grpc.StatusCode.INVALID_ARGUMENT,
-                                        grpc.StatusCode.OUT_OF_RANGE):
-                        raise
-                    details = e.details()
-                    if e.code() == grpc.StatusCode.INVALID_ARGUMENT:
-                        if 'deadline too short' not in details:
-                            raise
-                    else:
-                        if 'maximum allowed stream duration' not in details:
-                            raise
+    In this case, responses are provided for interim results as well. If the
+    response is an interim one, print a line feed at the end of it, to allow
+    the next result to overwrite         try:it, until the response is a final one. For the
+    final one, print a newline to preserve the finalized transcription.
+    """
+    num_chars_printed = 0
 
-                    print('Resuming..')
-                    resume = True
-    except KeyboardInterrupt:
+    word_array = []
+
+    for response in responses:
+        if not response.results:
+            continue
+
+        # The `results` list is consecutive. For streaming, we only care about
+        # the first result being considered, since once it's `is_final`, it
+        # moves on to considering the next utterance.
+        result = response.results[0]
+        if not result.alternatives:
+            continue
+
+        # Display the transcription of the top alternative.
+        top_alternative = result.alternatives[0]
+
+        transcript = top_alternative.transcript
+        transcript_words = transcript.split(' ')
+
+        new_words = [item for item in transcript_words if item not in word_array]
+
+        word_array.extend(new_words)
+
+        for word in new_words:
+            utterance = Utterance()
+            utterance.data = word.strip()
+            utterance.confidence = result.stability
+            word_publisher.publish(utterance)
+
+            print("publishing new word %s %.2f" % (utterance.data, utterance.confidence))
+
+        if result.is_final:
+            utterance = Utterance()
+            utterance.data = transcript.strip()
+            utterance.confidence = top_alternative.confidence
+            sentence_publisher.publish(utterance)
+
+            print("publishing sentence %s %.2f" % (utterance.data, utterance.confidence))
+
+
+
+
+
+
+def listen_publish_loop(responses, stream):
+    """Iterates through server responses and prints them.
+
+    Same as in transcribe_streaming_mic, but keeps track of when a sent
+    audio_chunk has been transcribed.
+    """
+    with_results = (r for r in responses if (r.results and r.results[0].alternatives))
+    listen_publish_loop_finite(_record_keeper(with_results, stream))
+
+
+
+
+
+# Register for Sigint due to generator issues...
+def signal_handler(signal, frame):
+        print('Exit gracefully...')
         sys.exit(0)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--rate', default=16000, help='Sample rate.', type=int)
-    args = parser.parse_args()
-    main(args.rate)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+
+
+
+# Initialize ROS stuff
+rospy.init_node('gspeech_node', anonymous=True)
+# Publishers
+word_publisher = rospy.Publisher('/stt/words', Utterance, queue_size=10)
+sentence_publisher = rospy.Publisher('/stt/sentences', Utterance, queue_size=10)
+
+# See http://g.co/cloud/speech/docs/languages
+# for a list of supported languages.
+language_code = 'en-US'  # a BCP-47 language tag
+
+client = speech.SpeechClient()
+config = types.RecognitionConfig(
+    encoding=enums.RecognitionConfig.AudioEncoding.LINEAR16,
+    sample_rate_hertz=16000,
+    language_code=language_code,
+    max_alternatives=1,
+    enable_word_time_offsets=True)
+streaming_config = types.StreamingRecognitionConfig(
+    config=config,
+    interim_results=True)
+
+
+mic_manager = ResumableMicrophoneStream(16000, int(16000 / 10))
+
+
+with mic_manager as stream:
+    resume = False
+    while True:
+
+        audio_generator = stream.generator(resume=resume)
+        requests = (types.StreamingRecognizeRequest(audio_content=content)
+                    for content in audio_generator)
+        responses = client.streaming_recognize(streaming_config, requests)
+
+        try:
+            # Now, put the transcription responses to use.
+            #listen_print_loop(responses, stream)
+            listen_publish_loop(responses, stream)
+
+        except grpc.RpcError, e:
+            """
+            if e.code() not in (grpc.StatusCode.INVALID_ARGUMENT,
+                                grpc.StatusCode.OUT_OF_RANGE):
+                raise
+            details = e.details()
+            if e.code() == grpc.StatusCode.INVALID_ARGUMENT:
+                if 'deadline too short' not in details:
+                    raise
+            else:
+                if 'maximum allowed stream duration' not in details:
+                    raise
+            """
+            print('Resuming..')
+            resume = True
